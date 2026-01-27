@@ -34,11 +34,21 @@ class InputFeatures(object):
                  input_tokens,
                  input_ids,
                  label,
-                 connection_matrix):
+                 connection_matrix,
+                 in_degrees=None,
+                 out_degrees=None,
+                 line_numbers=None,
+                 token_positions=None,
+                 token_labels=None):
         self.input_tokens = input_tokens
         self.input_ids = input_ids
         self.label=label
         self.connection_matrix = connection_matrix
+        self.in_degrees = in_degrees
+        self.out_degrees = out_degrees
+        self.line_numbers = line_numbers
+        self.token_positions = token_positions
+        self.token_labels = token_labels
 
         
 
@@ -56,13 +66,20 @@ class TextDataset(Dataset):
         df = pd.read_json(file_path)
         funcs = df["func"].tolist()
         labels = df["target"].tolist()
+        flaw_lines = df.get("flaw_line_index", [None] * len(funcs)).tolist()
         for i in tqdm(range(len(funcs))):
             if funcs[i].count('\n') < 100:
                 cpg_path = os.path.join(self.cpg_directory, f"{i}.c", "export.json")
                 if os.path.exists(cpg_path):
                     with open(cpg_path, 'r') as file:
                         cpg_data = json.load(file)
-                    self.examples.append(convert_examples_to_features(funcs[i], labels[i], cpg_data, tokenizer, args))
+                    features, line_nums, token_pos, token_labs = convert_examples_to_features(
+                        funcs[i], labels[i], cpg_data, tokenizer, args, flaw_lines[i]
+                    )
+                    features.line_numbers = line_nums
+                    features.token_positions = token_pos
+                    features.token_labels = token_labs
+                    self.examples.append(features)
         if file_type == "train":
             for example in self.examples[:3]:
                     logger.info("*** Example ***")
@@ -73,8 +90,15 @@ class TextDataset(Dataset):
     def __len__(self):
         return len(self.examples)
 
-    def __getitem__(self, i):       
-        return torch.tensor(self.examples[i].input_ids),torch.tensor(self.examples[i].label),torch.tensor(self.examples[i].connection_matrix)
+    def __getitem__(self, i):
+        return (torch.tensor(self.examples[i].input_ids),
+                torch.tensor(self.examples[i].label),
+                torch.tensor(self.examples[i].connection_matrix),
+                torch.tensor(self.examples[i].in_degrees),
+                torch.tensor(self.examples[i].out_degrees),
+                torch.tensor(self.examples[i].line_numbers),
+                torch.tensor(self.examples[i].token_positions),
+                torch.tensor(self.examples[i].token_labels))
 # def preprocess_source_code(source_code):
 #     # Regular expressions for single-line and multi-line comments
 #     single_line_comment_re = r"//.*"
@@ -101,60 +125,74 @@ class TextDataset(Dataset):
 
 #     return processed_code
 
-def convert_examples_to_features(func, label, cpg_data, tokenizer, args):
-    # if args.use_word_level_tokenizer:
-    #     encoded = tokenizer.encode(func)
-    #     encoded = encoded.ids
-    #     if len(encoded) > 510:
-    #         encoded = encoded[:510]
-    #     encoded.insert(0, 0)
-    #     encoded.append(2)
-    #     if len(encoded) < 512:
-    #         padding = 512 - len(encoded)
-    #         for _ in range(padding):
-    #             encoded.append(1)
-    #     source_ids = encoded
-    #     source_tokens = []
-    #     return InputFeatures(source_tokens, source_ids, label)
-    # source
-    classifier = joblib.load('class.py')
+def convert_examples_to_features(func, label, cpg_data, tokenizer, args, flaw_line_index=None):
+    # Parse source code line by line
     lines = func.strip().split('\n')
     line_to_tokens = {}
-    line_number = 0
-    
+    all_input_ids = []
+    line_numbers = []
+    token_positions = []
+    token_to_line = []  # Track which line each token belongs to
+
+    # Tokenize each line and track positions
     for i, line in enumerate(lines):
-        tokens = tokenizer.tokenizer(line)
-        # print(tokens)
-        line_to_tokens[i+1] = tokens
-        line_number = line_number + 1
-    
-    token_list = [token for tokens in line_to_tokens.values() for token in tokens]
+        tokens = tokenizer.tokenize(line)
+        input_ids = tokenizer.convert_tokens_to_ids(tokens)
+        line_to_tokens[i+1] = {'tokens': tokens, 'input_ids': input_ids}
 
-    embed_tokens = []
-    for i, _ in enumerate(lines):
-        index = i+1
-        input_ids = line_to_tokens[index]['input_ids']
-        token_positions = list(range(len(input_ids)))
-        positional_encoding = PositionalEncoding2D(len(input_ids), max_lines=len(lines), max_line_length=max(len(line.split()) for line in lines))
-        pos_encoded_tensor = positional_encoding(input_ids, line_number, token_positions)
+        # Track line number and token position for each token
+        for j, token_id in enumerate(input_ids):
+            all_input_ids.append(token_id)
+            line_numbers.append(i)  # 0-indexed line number
+            token_positions.append(j)  # Position within the line
+            token_to_line.append(i+1)  # 1-indexed for compatibility
 
+    # Add special tokens (CLS and SEP)
+    all_input_ids = [tokenizer.cls_token_id] + all_input_ids + [tokenizer.sep_token_id]
+    line_numbers = [0] + line_numbers + [len(lines)-1]
+    token_positions = [0] + token_positions + [0]
+    token_to_line = [0] + token_to_line + [len(lines)]
 
-        type_embedding = TypeEmbedding(len(input_ids), num_types=9)
-        type_annotations = type_embedding.classify_c_code(func)
-        type_indices = [type_embedding.type_to_index(annotations[1]) for annotations in type_annotations]
+    # Truncate if too long
+    max_length = 512
+    if len(all_input_ids) > max_length:
+        all_input_ids = all_input_ids[:max_length]
+        line_numbers = line_numbers[:max_length]
+        token_positions = token_positions[:max_length]
+        token_to_line = token_to_line[:max_length]
 
-        type_tensors = torch.tensor([type_indices[i]], dtype=torch.long)
+    # Pad to max_length
+    padding_length = max_length - len(all_input_ids)
+    all_input_ids += [tokenizer.pad_token_id] * padding_length
+    line_numbers += [0] * padding_length
+    token_positions += [0] * padding_length
+    token_to_line += [0] * padding_length
 
-        embed_tokens.append(type_embedding(type_tensors, input_ids), pos_encoded_tensor)
+    # Create token-level labels for vulnerability localization
+    token_labels = [0] * max_length  # 0 = non-vulnerable
+    if flaw_line_index is not None and flaw_line_index != "":
+        try:
+            flaw_lines = [int(x.strip()) for x in str(flaw_line_index).split(',')]
+            for idx, line_num in enumerate(token_to_line):
+                if line_num in flaw_lines:
+                    token_labels[idx] = 1  # 1 = vulnerable
+        except:
+            pass  # If parsing fails, keep all labels as 0
 
+    # Build CPG connection matrix
+    token_list = [tokenizer.convert_ids_to_tokens([tid])[0] for tid in all_input_ids]
     token_to_index = {token: i for i, token in enumerate(token_list)}
     processor = CPGProcessor(token_to_index, line_to_tokens)
-    # Map type indices to tokens
-    connection_matrix = processor.process(cpg_data, args)
-    # print(source_ids.shape)
-    # print(type_embed_tokens.shape)
-    # source_tokens = source_ids + type_embed_tokens
-    return InputFeatures(embed_tokens, token_list, label, connection_matrix)
+    connection_matrix, in_degrees, out_degrees = processor.process(cpg_data, args)
+
+    return InputFeatures(
+        input_tokens=token_list,
+        input_ids=all_input_ids,
+        label=label,
+        connection_matrix=connection_matrix,
+        in_degrees=in_degrees,
+        out_degrees=out_degrees
+    ), line_numbers, token_positions, token_labels
 
 # Function to match AST nodes with tokens and add syntax type
 def match_ast_nodes_with_tokens_and_syntax(tokens, node_info, syntax_predictions):
@@ -236,9 +274,21 @@ def train(args, train_dataset, model, tokenizer, eval_dataset):
         tr_num = 0
         train_loss = 0
         for step, batch in enumerate(bar):
-            (inputs_ids, labels, connection_matrix) = [x.to(args.device) for x in batch]
+            (inputs_ids, labels, connection_matrix, in_degrees, out_degrees, line_numbers, token_positions, token_labels) = [x.to(args.device) for x in batch]
             model.train()
-            loss, logits = model(input_ids=inputs_ids, labels=labels, connection_matrix=connection_matrix)
+            outputs = model(input_ids=inputs_ids, labels=labels, connection_matrix=connection_matrix,
+                          in_degrees=in_degrees, out_degrees=out_degrees,
+                          line_numbers=line_numbers, token_positions=token_positions, token_labels=token_labels)
+
+            # Handle different output formats (with/without token predictions)
+            if len(outputs) == 3:
+                loss, logits, token_probs = outputs
+            elif len(outputs) == 2:
+                loss, logits = outputs
+            else:
+                loss = outputs[0]
+                logits = outputs[1]
+
             if args.n_gpu > 1:
                 loss = loss.mean()
             if args.gradient_accumulation_steps > 1:
@@ -300,12 +350,24 @@ def evaluate(args, model, tokenizer, eval_dataset, eval_when_training=False):
     eval_loss = 0.0
     nb_eval_steps = 0
     model.eval()
-    logits=[]  
+    logits=[]
     y_trues=[]
     for batch in eval_dataloader:
-        (inputs_ids, labels)=[x.to(args.device) for x in batch]
+        (inputs_ids, labels, connection_matrix, in_degrees, out_degrees, line_numbers, token_positions, token_labels) = [x.to(args.device) for x in batch]
         with torch.no_grad():
-            lm_loss, logit = model(input_ids=inputs_ids, labels=labels)
+            outputs = model(input_ids=inputs_ids, labels=labels, connection_matrix=connection_matrix,
+                          in_degrees=in_degrees, out_degrees=out_degrees,
+                          line_numbers=line_numbers, token_positions=token_positions, token_labels=token_labels)
+
+            # Handle different output formats
+            if len(outputs) == 3:
+                lm_loss, logit, token_probs = outputs
+            elif len(outputs) == 2:
+                lm_loss, logit = outputs
+            else:
+                lm_loss = outputs[0]
+                logit = outputs[1]
+
             eval_loss += lm_loss.mean().item()
             logits.append(logit.cpu().numpy())
             y_trues.append(labels.cpu().numpy())
@@ -352,12 +414,24 @@ def test(args, model, tokenizer, test_dataset, best_threshold=0.5):
     eval_loss = 0.0
     nb_eval_steps = 0
     model.eval()
-    logits=[]  
+    logits=[]
     y_trues=[]
     for batch in test_dataloader:
-        (inputs_ids, labels) = [x.to(args.device) for x in batch]
+        (inputs_ids, labels, connection_matrix, in_degrees, out_degrees, line_numbers, token_positions, token_labels) = [x.to(args.device) for x in batch]
         with torch.no_grad():
-            lm_loss, logit = model(input_ids=inputs_ids, labels=labels)
+            outputs = model(input_ids=inputs_ids, labels=labels, connection_matrix=connection_matrix,
+                          in_degrees=in_degrees, out_degrees=out_degrees,
+                          line_numbers=line_numbers, token_positions=token_positions, token_labels=token_labels)
+
+            # Handle different output formats
+            if len(outputs) == 3:
+                lm_loss, logit, token_probs = outputs
+            elif len(outputs) == 2:
+                lm_loss, logit = outputs
+            else:
+                lm_loss = outputs[0]
+                logit = outputs[1]
+
             eval_loss += lm_loss.mean().item()
             logits.append(logit.cpu().numpy())
             y_trues.append(labels.cpu().numpy())

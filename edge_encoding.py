@@ -294,6 +294,32 @@ class CPGProcessor:
 
         return matrix
 
+    def compute_token_degrees(self, num_tokens, edges):
+        """
+        Compute in-degree and out-degree for each token based on ICDG edges.
+
+        Args:
+            num_tokens (int): Total number of tokens
+            edges (list): List of edge tuples (from_line, to_line)
+
+        Returns:
+            tuple: (in_degrees, out_degrees) - lists of length num_tokens
+        """
+        in_degrees = [0] * num_tokens
+        out_degrees = [0] * num_tokens
+
+        for edge in edges:
+            from_line, to_line = edge
+            for from_token in self.line_to_token.get(from_line, []):
+                for to_token in self.line_to_token.get(to_line, []):
+                    i = self.token_to_index.get(from_token)
+                    j = self.token_to_index.get(to_token)
+                    if i is not None and j is not None:
+                        out_degrees[i] += 1
+                        in_degrees[j] += 1
+
+        return in_degrees, out_degrees
+
     def process(self, cpg_data, control_flow_weight=2, control_dependency_weight=3, data_dependency_weight=7):
         data = cpg_data
 
@@ -314,7 +340,12 @@ class CPGProcessor:
         data_dependency_matrix = self.create_adjacency_matrix(num_tokens, data_dependency_edges, data_dependency_weight)
 
         # Sum the matrices
-        combined_matrix = [[control_flow_matrix[i][j] + control_dependency_matrix[i][j] + data_dependency_matrix[i][j] 
+        combined_matrix = [[control_flow_matrix[i][j] + control_dependency_matrix[i][j] + data_dependency_matrix[i][j]
                             for j in range(num_tokens)] for i in range(num_tokens)]
-        return combined_matrix
+
+        # Compute in-degree and out-degree from ICDG (combined edges)
+        all_icdg_edges = control_flow_edges + control_dependency_edges + data_dependency_edges
+        in_degrees, out_degrees = self.compute_token_degrees(num_tokens, all_icdg_edges)
+
+        return combined_matrix, in_degrees, out_degrees
 

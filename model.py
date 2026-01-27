@@ -15,6 +15,7 @@ from transformers.models.bert.modeling_bert import BertAttention, BertIntermedia
 from transformers.modeling_outputs import BaseModelOutputWithPoolingAndCrossAttentions
 
 from transformers.models.bert.configuration_bert import BertConfig
+from degree_encoding import DegreeEmbedding
 
 
 class RobertaClassificationHead(nn.Module):
@@ -33,21 +34,50 @@ class RobertaClassificationHead(nn.Module):
         x = self.dropout(x)
         x = self.out_proj(x)
         return x
+
+class TokenClassificationHead(nn.Module):
+    """Head for token-level classification tasks (vulnerability localization)."""
+    def __init__(self, config):
+        super().__init__()
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.out_proj = nn.Linear(config.hidden_size, 2)  # Binary: vulnerable or not
+
+    def forward(self, features, **kwargs):
+        # features: [batch_size, seq_len, hidden_size]
+        x = self.dropout(features)
+        x = self.dense(x)
+        x = torch.tanh(x)
+        x = self.dropout(x)
+        x = self.out_proj(x)  # [batch_size, seq_len, 2]
+        return x
         
-class Model(RobertaForSequenceClassification):   
+class Model(RobertaForSequenceClassification):
     def __init__(self, encoder, config, tokenizer, args):
         super(Model, self).__init__(config=config)
         self.encoder = encoder
         self.tokenizer = tokenizer
         self.classifier = RobertaClassificationHead(config)
+        self.token_classifier = TokenClassificationHead(config)  # Add token-level classifier
         self.args = args
         self.linear_q = nn.Linear(config.hidden_size, config.hidden_size)
         self.linear_k = nn.Linear(config.hidden_size, config.hidden_size)
         self.linear_v = nn.Linear(config.hidden_size, config.hidden_size)
+
+        # Add degree embedding module
+        self.degree_embedding = DegreeEmbedding(config.hidden_size, max_degree=100)
+
+        # Add 2D positional encoding
+        from positional_encoding import PositionalEncoding2D
+        self.positional_encoding = PositionalEncoding2D(
+            embed_size=config.hidden_size,
+            max_lines=100,
+            max_line_length=512
+        )
     
         
-    def forward(self, input_embed=None, labels=None, output_attentions=False, input_ids=None,connection_matrix=None):
-        
+    def forward(self, input_embed=None, labels=None, output_attentions=False, input_ids=None, connection_matrix=None, in_degrees=None, out_degrees=None, line_numbers=None, token_positions=None, token_labels=None):
+
         if output_attentions:
             if input_ids is not None:
                 outputs = self.encoder.roberta(input_ids, attention_mask=input_ids.ne(1), output_attentions=output_attentions)
@@ -55,7 +85,15 @@ class Model(RobertaForSequenceClassification):
                 outputs = self.encoder.roberta(inputs_embeds=input_embed, output_attentions=output_attentions)
             attentions = outputs.attentions
             last_hidden_state = outputs.last_hidden_state
-            
+
+            # Apply 2D positional encoding if line_numbers and token_positions are provided
+            if line_numbers is not None and token_positions is not None:
+                last_hidden_state = self.positional_encoding(last_hidden_state, line_numbers, token_positions)
+
+            # Apply degree embeddings if provided
+            if in_degrees is not None and out_degrees is not None:
+                last_hidden_state = self.degree_embedding(last_hidden_state, in_degrees, out_degrees)
+
             if connection_matrix is not None:
                 q = self.linear_q(last_hidden_state)
                 k = self.linear_k(last_hidden_state)
@@ -63,29 +101,72 @@ class Model(RobertaForSequenceClassification):
                 last_hidden_state = torch.matmul(q, k)
                 last_hidden_state = last_hidden_state * connection_matrix.unsqueeze(-1)
                 attentions = torch.matmul(last_hidden_state, v)
+
+            # Function-level classification
             logits = self.classifier(last_hidden_state)
             prob = torch.softmax(logits, dim=-1)
+
+            # Token-level classification
+            token_logits = self.token_classifier(last_hidden_state)
+            token_prob = torch.softmax(token_logits, dim=-1)
+
             if labels is not None:
                 loss_fct = CrossEntropyLoss()
                 loss = loss_fct(logits, labels)
-                return loss, prob, attentions
+
+                # Add token-level loss if token_labels are provided
+                if token_labels is not None:
+                    token_loss_fct = CrossEntropyLoss()
+                    # Reshape for loss calculation
+                    token_logits_flat = token_logits.view(-1, 2)
+                    token_labels_flat = token_labels.view(-1)
+                    token_loss = token_loss_fct(token_logits_flat, token_labels_flat)
+                    loss = loss + token_loss  # Combine losses
+
+                return loss, prob, attentions, token_prob
             else:
-                return prob, attentions
+                return prob, attentions, token_prob
         else:
             if input_ids is not None:
                 outputs = self.encoder.roberta(input_ids, attention_mask=input_ids.ne(1), output_attentions=output_attentions)[0]
             else:
                 outputs = self.encoder.roberta(inputs_embeds=input_embed, output_attentions=output_attentions)[0]
+
+            # Apply 2D positional encoding if line_numbers and token_positions are provided
+            if line_numbers is not None and token_positions is not None:
+                outputs = self.positional_encoding(outputs, line_numbers, token_positions)
+
+            # Apply degree embeddings if provided
+            if in_degrees is not None and out_degrees is not None:
+                outputs = self.degree_embedding(outputs, in_degrees, out_degrees)
+
             if connection_matrix is not None:
-                last_hidden_state = last_hidden_state * connection_matrix.unsqueeze(-1)
+                outputs = outputs * connection_matrix.unsqueeze(-1)
+
+            # Function-level classification
             logits = self.classifier(outputs)
             prob = torch.softmax(logits, dim=-1)
+
+            # Token-level classification
+            token_logits = self.token_classifier(outputs)
+            token_prob = torch.softmax(token_logits, dim=-1)
+
             if labels is not None:
                 loss_fct = CrossEntropyLoss()
                 loss = loss_fct(logits, labels)
-                return loss, prob
+
+                # Add token-level loss if token_labels are provided
+                if token_labels is not None:
+                    token_loss_fct = CrossEntropyLoss()
+                    # Reshape for loss calculation
+                    token_logits_flat = token_logits.view(-1, 2)
+                    token_labels_flat = token_labels.view(-1)
+                    token_loss = token_loss_fct(token_logits_flat, token_labels_flat)
+                    loss = loss + token_loss  # Combine losses
+
+                return loss, prob, token_prob
             else:
-                return prob
+                return prob, token_prob
 
 class BertModel(PreTrainedModel):
     def __init__(self, encoder, config, tokenizer, args):
@@ -94,9 +175,21 @@ class BertModel(PreTrainedModel):
         self.encoder = encoder
         self.tokenizer = tokenizer
         self.classifier = RobertaClassificationHead(config)
+        self.token_classifier = TokenClassificationHead(config)  # Add token-level classifier
         self.args = args
 
-    def forward(self, input_embed=None, labels=None, output_attentions=False, input_ids=None, connection_matrix=None):
+        # Add degree embedding module
+        self.degree_embedding = DegreeEmbedding(config.hidden_size, max_degree=100)
+
+        # Add 2D positional encoding
+        from positional_encoding import PositionalEncoding2D
+        self.positional_encoding = PositionalEncoding2D(
+            embed_size=config.hidden_size,
+            max_lines=100,
+            max_line_length=512
+        )
+
+    def forward(self, input_embed=None, labels=None, output_attentions=False, input_ids=None, connection_matrix=None, in_degrees=None, out_degrees=None, line_numbers=None, token_positions=None, token_labels=None):
         r"""
         encoder_hidden_states  (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`, *optional*):
             Sequence of hidden-states at the output of the last layer of the encoder. Used in the cross-attention if
@@ -125,6 +218,13 @@ class BertModel(PreTrainedModel):
             attentions = outputs.attentions
             last_hidden_state = outputs.last_hidden_state
 
+            # Apply 2D positional encoding if line_numbers and token_positions are provided
+            if line_numbers is not None and token_positions is not None:
+                last_hidden_state = self.positional_encoding(last_hidden_state, line_numbers, token_positions)
+
+            # Apply degree embeddings if provided
+            if in_degrees is not None and out_degrees is not None:
+                last_hidden_state = self.degree_embedding(last_hidden_state, in_degrees, out_degrees)
 
             # if connection_matrix is not None:
             #     q = self.linear_q(last_hidden_state)
@@ -133,30 +233,72 @@ class BertModel(PreTrainedModel):
             #     last_hidden_state = torch.matmul(q, k)
             #     last_hidden_state = last_hidden_state * connection_matrix.unsqueeze(-1)
             #     attentions = torch.matmul(last_hidden_state, v)
-            
+
+            # Function-level classification
             logits = self.classifier(last_hidden_state)
             prob = torch.softmax(logits, dim=-1)
+
+            # Token-level classification
+            token_logits = self.token_classifier(last_hidden_state)
+            token_prob = torch.softmax(token_logits, dim=-1)
+
             if labels is not None:
                 loss_fct = CrossEntropyLoss()
                 loss = loss_fct(logits, labels)
-                return loss, prob, attentions
+
+                # Add token-level loss if token_labels are provided
+                if token_labels is not None:
+                    token_loss_fct = CrossEntropyLoss()
+                    # Reshape for loss calculation
+                    token_logits_flat = token_logits.view(-1, 2)
+                    token_labels_flat = token_labels.view(-1)
+                    token_loss = token_loss_fct(token_logits_flat, token_labels_flat)
+                    loss = loss + token_loss  # Combine losses
+
+                return loss, prob, attentions, token_prob
             else:
-                return prob, attentions
+                return prob, attentions, token_prob
         else:
             if input_ids is not None:
                 outputs = self.encoder.roberta(input_ids, attention_mask=input_ids.ne(1), output_attentions=output_attentions)[0]
             else:
                 outputs = self.encoder.roberta(inputs_embeds=input_embed, output_attentions=output_attentions)[0]
+
+            # Apply 2D positional encoding if line_numbers and token_positions are provided
+            if line_numbers is not None and token_positions is not None:
+                outputs = self.positional_encoding(outputs, line_numbers, token_positions)
+
+            # Apply degree embeddings if provided
+            if in_degrees is not None and out_degrees is not None:
+                outputs = self.degree_embedding(outputs, in_degrees, out_degrees)
+
             if connection_matrix is not None:
-                last_hidden_state = last_hidden_state * connection_matrix.unsqueeze(-1)
+                outputs = outputs * connection_matrix.unsqueeze(-1)
+
+            # Function-level classification
             logits = self.classifier(outputs)
             prob = torch.softmax(logits, dim=-1)
+
+            # Token-level classification
+            token_logits = self.token_classifier(outputs)
+            token_prob = torch.softmax(token_logits, dim=-1)
+
             if labels is not None:
                 loss_fct = CrossEntropyLoss()
                 loss = loss_fct(logits, labels)
-                return loss, prob
+
+                # Add token-level loss if token_labels are provided
+                if token_labels is not None:
+                    token_loss_fct = CrossEntropyLoss()
+                    # Reshape for loss calculation
+                    token_logits_flat = token_logits.view(-1, 2)
+                    token_labels_flat = token_labels.view(-1)
+                    token_loss = token_loss_fct(token_logits_flat, token_labels_flat)
+                    loss = loss + token_loss  # Combine losses
+
+                return loss, prob, token_prob
             else:
-                return prob
+                return prob, token_prob
 
 
 
